@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hume-tada"
+description = "Text-Acoustic Dual-Aligned Language Model"
+authors = [{ name = "Hume Research" }]
+requires-python = ">=3.10"
+readme = "README.md"  # For PyPI releases, swap to PYPI_README.md before building
+license = { file = "LICENSE" }
+classifiers = ["License :: OSI Approved :: MIT License"]
+dynamic = ["version"]
+dependencies = [
+    # "descript-audiotools @ git+ssh://git@github.com/HumeAI/descript-audiotools.git@master",
+    "transformers>=4.57.1",
+    "torch>=2.7.0,<2.8.0",
+    "torchaudio",
+    "torchvision",
+]
+
+[tool.setuptools.dynamic]
+version = { file = "VERSION" }
+
+[tool.setuptools.package-data]
+tada = ["samples/*.wav", "samples/*.json"]
+
+[tool.setuptools.packages.find]
+include = ["tada*"]
+exclude = ["tada.scripts*"]
+
+[tool.ruff]
+line-length = 120
+indent-width = 4
+
+[tool.ruff.lint]
+ignore = ["E203", "E501"]
+extend-select = ["I"]
+
+[tool.pytest.ini_options]
+log_cli_level = "DEBUG"
+
+[tool.uv.sources]
+# descript-audiotools = { index = "humepy" }
+# whisperspeech-hume = { index = "humepy" }
+
+[tool.uv]
+dev-dependencies = ["mypy>=1.17.1", "pytest>=8.4.1", "ruff>=0.12.9"]
+keyring-provider = "subprocess"

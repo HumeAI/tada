@@ -1,0 +1,10 @@
+# Speech-Text Feature Extractor - Independent Library Requirements
+# Core dependencies (required)
+torch>=2.0.0
+torchaudio>=2.0.0
+transformers>=4.30.0
+
+# Note: The library is fully independent and does NOT require
+# the tokenization package for runtime usage. The only exception
+# is the from_pretrained() method which requires it for loading
+# pretrained checkpoints, but once loaded, no dependency exists.
