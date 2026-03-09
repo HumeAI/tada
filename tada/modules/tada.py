@@ -850,6 +850,26 @@ class TadaForCausalLM(LlamaForCausalLM):
                 ref_spkr_emb = torch.nn.functional.normalize(ref_spkr_emb, dim=-1)  # [B, 192]
 
         step_logs = []
+        # Add step_log entries for prefilled steps (so alignment visualization is complete)
+        for s in range(step_start):
+            token_id = input_ids[0, s].item()
+            token_str = self.tokenizer.convert_ids_to_tokens([token_id])[0]
+            if s >= shift_acoustic and (s - shift_acoustic + 1) < prompt_time_len_before.shape[1]:
+                t_before = prompt_time_len_before[0, s - shift_acoustic + 1].item()
+                t_after = prompt_time_len_after[0, s - shift_acoustic + 1].item()
+            else:
+                t_before = 0
+                t_after = 0
+            step_logs.append({
+                "step": s,
+                "token": token_str,
+                "n_frames_before": t_before,
+                "n_frames_after": t_after,
+                "n_frames_src": "prompted",
+                "acoustic_mask": 1 if s >= shift_acoustic else 0,
+                "acoustic_feat_src": "prefilled",
+                "acoustic_feat_norm": 0.0,
+            })
         last_time_before = None
         for step in range(step_start, num_steps):
             # When step >= input_ids.shape[1] we are generating; use last token as input for forward
