@@ -123,6 +123,19 @@ output = model.generate(
 )
 ```
 
+## 📚 Citation
+
+If you use this project in your research, please cite our paper:
+
+```bibtex
+@article{dang2026tada,
+  title={TADA: A Generative Framework for Speech Modeling via Text-Acoustic Dual Alignment},
+  author={Dang, Trung and Rao, Sharath and Gupta, Ananya and Gagne, Christopher and Tzirakis, Panagiotis and Baird, Alice and Cłapa, Jakub Piotr and Chin, Peter and Cowen, Alan},
+  journal={arXiv preprint arXiv:2602.23068},
+  year={2026}
+}
+```
+
 ## Contact
 
 [Hume AI](https://hume.ai) is an empathic AI research company. We research the datasets, tools, and models needed to give empathy to AI models to serve human wellbeing. If you're interested in any of our product or research collaborations, please reach out to us at hello@hume.ai.
