@@ -13,10 +13,11 @@ classifiers = ["License :: OSI Approved :: MIT License"]
 dynamic = ["version"]
 dependencies = [
     # "descript-audiotools @ git+ssh://git@github.com/HumeAI/descript-audiotools.git@master",
-    "transformers>=4.57.1",
+    "transformers>=4.57.1,<5",
     "torch>=2.7.0,<2.8.0",
     "torchaudio",
     "torchvision",
+    "descript-audio-codec>=1.0.0",
 ]
 
 [tool.setuptools.dynamic]
@@ -45,5 +46,10 @@ log_cli_level = "DEBUG"
 # whisperspeech-hume = { index = "humepy" }
 
 [tool.uv]
-dev-dependencies = ["mypy>=1.17.1", "pytest>=8.4.1", "ruff>=0.12.9"]
+dev-dependencies = [
+    "ipykernel>=7.2.0",
+    "mypy>=1.17.1",
+    "pytest>=8.4.1",
+    "ruff>=0.12.9",
+]
 keyring-provider = "subprocess"
