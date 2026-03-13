@@ -4,7 +4,7 @@ import pytest
 import torch
 import torchaudio
 
-from ..utils.test_utils import get_sample_dir
+from ..utils.test_utils import get_sample_dir, skip_if_hub_model_unavailable
 from .decoder import Decoder, DecoderConfig
 from .encoder import Encoder, EncoderConfig
 
@@ -23,6 +23,8 @@ def test_decoder(model_name_or_path: str | None):
         encoder = Encoder(EncoderConfig())
         decoder = Decoder(DecoderConfig())
     else:
+        skip_if_hub_model_unavailable(model_name_or_path, subfolder="encoder")
+        skip_if_hub_model_unavailable(model_name_or_path, subfolder="decoder")
         encoder = Encoder.from_pretrained(model_name_or_path, subfolder="encoder").to(device)
         decoder = Decoder.from_pretrained(model_name_or_path, subfolder="decoder").to(device)
     audio, sample_rate = torchaudio.load(os.path.join(get_sample_dir(), "ljspeech.wav"))
