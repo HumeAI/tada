@@ -16,7 +16,7 @@ from ..utils.gray_code import decode_gray_code_to_time
 from ..utils.text import normalize_text as normalize_text_fn
 from .acoustic_spkr_verf import AcousticSpkrVerf
 from .decoder import Decoder, DecoderConfig
-from .encoder import Encoder, EncoderConfig, EncoderOutput
+from .encoder import AutoTokenizer, EncoderOutput
 
 
 @dataclass
@@ -173,19 +173,13 @@ class TadaForCausalLM(LlamaForCausalLM):
         self.time_end_embed = torch.nn.Embedding(config.num_time_classes, config.hidden_size)
         self.acoustic_mask_emb = torch.nn.Embedding(num_embeddings=2, embedding_dim=config.hidden_size)
         self.acoustic_mask_emb.weight.data.fill_(0)
+        self.tokenizer = AutoTokenizer.from_pretrained(config.tokenizer_name)
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, *args, **kwargs):
         self = super().from_pretrained(pretrained_model_name_or_path, *args, **kwargs)
-        self._encoder = Encoder.from_pretrained("HumeAI/tada-codec", subfolder="encoder")
         self._decoder = Decoder.from_pretrained("HumeAI/tada-codec", subfolder="decoder")
         return self
-
-    @property
-    def encoder(self) -> Encoder:
-        if not hasattr(self, "_encoder"):
-            self._encoder = Encoder(EncoderConfig())
-        return self._encoder
 
     @property
     def decoder(self) -> Decoder:
@@ -1305,10 +1299,6 @@ class TadaForCausalLM(LlamaForCausalLM):
         )
 
     @property
-    def tokenizer(self):
-        return self.encoder.tokenizer
-
-    @property
     def eos_id(self):
         return self.tokenizer.convert_tokens_to_ids("<|eot_id|>")
 
@@ -1330,8 +1320,8 @@ class TadaForCausalLM(LlamaForCausalLM):
     def compile(self):
         self.model.forward = torch.compile(self.model.forward)
         self.prediction_head.forward = torch.compile(self.prediction_head.forward, mode="reduce-overhead")
-        self.prediction_head.forward = torch.compile(self.prediction_head.forward, mode="reduce-overhead")
 
-    def to(self, device: str):
-        self.decoder.to(device)
-        return super().to(device)
+    def to(self, *args, **kwargs):
+        if hasattr(self, "_decoder"):
+            self._decoder.to(*args, **kwargs)
+        return super().to(*args, **kwargs)
