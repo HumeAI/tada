@@ -108,7 +108,7 @@ import torch
 import torchaudio
 
 from tada.modules.encoder import Encoder, EncoderOutput
-from tada.modules.tada import TadaForCausalLM
+from tada.modules.tada import InferenceOptions, TadaForCausalLM
 
 device = "cuda"
 
@@ -132,6 +132,41 @@ output = model.generate(
     text="Please call Stella. Ask her to bring these things with her from the store.",
 )
 ```
+
+### Custom inference settings
+
+Advanced acoustic parameters such as `noise_temperature`, `acoustic_cfg_scale`, `duration_cfg_scale`,
+`num_flow_matching_steps`, and other sampling controls are configured through the `InferenceOptions`
+dataclass. Pass them via the `inference_options` argument—`model.generate()` does not accept these values as
+top-level keyword arguments.
+
+```python
+opts = InferenceOptions(
+    acoustic_cfg_scale=1.8,
+    duration_cfg_scale=1.0,
+    num_flow_matching_steps=20,
+    num_acoustic_candidates=4,
+    scorer="spkr_verification",
+    spkr_verification_weight=1.0,
+    negative_condition_source="prompt",
+    speed_up_factor=1.1,
+)
+
+output = model.generate(
+    prompt=prompt,
+    text="Please call Stella. Ask her to bring these things with her from the store.",
+    inference_options=opts,
+)
+```
+
+Useful options:
+
+- `acoustic_cfg_scale`, `duration_cfg_scale`, `cfg_schedule` — control classifier-free guidance strength and schedule.
+- `num_flow_matching_steps`, `noise_temperature`, `time_schedule` — trade off generation speed vs. acoustic quality.
+- `text_temperature`, `text_top_p`, `text_top_k`, `text_repetition_penalty` — control text-token sampling behavior.
+- `negative_condition_source` — choose how the negative branch is built (`"negative_step_output"`, `"prompt"`, or `"zero"`).
+- `num_acoustic_candidates`, `scorer`, `spkr_verification_weight` — generate multiple acoustic candidates and rank them by likelihood, duration median, or speaker verification.
+- `speed_up_factor` — shorten predicted durations for faster speech.
 
 ### Multilingual Generation
 
