@@ -3,11 +3,12 @@ import os
 import torch
 import torchaudio
 
-from ..utils.test_utils import get_sample_dir
+from ..utils.test_utils import get_sample_dir, skip_if_hub_model_unavailable
 from .encoder import Encoder
 
 
 def test_encoder(model_name_or_path: str = "HumeAI/tada-codec", device: str = "cuda"):
+    skip_if_hub_model_unavailable(model_name_or_path, subfolder="encoder")
     encoder = Encoder.from_pretrained(model_name_or_path, subfolder="encoder").to(device)
     audio, sample_rate = torchaudio.load(os.path.join(get_sample_dir(), "ljspeech.wav"))
     audio = audio.to(device)
@@ -22,6 +23,7 @@ def test_token_values_are_local(model_name_or_path: str = "HumeAI/tada-codec", d
     """Test that token values are local.
     A change in one audio sample should only affect the immediately preceding and following token values.
     """
+    skip_if_hub_model_unavailable(model_name_or_path, subfolder="encoder")
     encoder = Encoder.from_pretrained(model_name_or_path, subfolder="encoder").to(device)
     encoder.eval()
     torch.manual_seed(42)

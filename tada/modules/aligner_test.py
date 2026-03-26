@@ -4,7 +4,7 @@ import pytest
 import torch
 import torchaudio
 
-from ..utils.test_utils import get_sample_dir
+from ..utils.test_utils import get_sample_dir, skip_if_hub_model_unavailable
 from .aligner import Aligner
 
 
@@ -17,6 +17,7 @@ from .aligner import Aligner
 )
 def test_aligner(model_name_or_path: str):
     device = "cpu"
+    skip_if_hub_model_unavailable(model_name_or_path, subfolder="aligner")
     aligner = Aligner.from_pretrained(model_name_or_path, subfolder="aligner").to(device)
     audio, sample_rate = torchaudio.load(os.path.join(get_sample_dir(), "ljspeech.wav"))
     audio = audio.to(device)

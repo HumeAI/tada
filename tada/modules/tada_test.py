@@ -4,7 +4,7 @@ import pytest
 import torch
 import torchaudio
 
-from ..utils.test_utils import get_sample_dir
+from ..utils.test_utils import get_sample_dir, skip_if_hub_model_unavailable
 from .encoder import Encoder, EncoderConfig
 from .tada import TadaConfig, TadaForCausalLM
 
@@ -26,6 +26,8 @@ def test_tada_for_causal_lm(model_name_or_path: str | None):
         )
         model = TadaForCausalLM(config)
     else:
+        skip_if_hub_model_unavailable(model_name_or_path, subfolder="encoder")
+        skip_if_hub_model_unavailable(model_name_or_path, subfolder="llm")
         encoder = Encoder.from_pretrained("HumeAI/TADA", subfolder="encoder").to(device)
         model = TadaForCausalLM.from_pretrained(model_name_or_path, subfolder="llm").to(device)
     encoder.to(device).eval()
