@@ -12,10 +12,11 @@ from transformers import AutoTokenizer
 from .aligner import Aligner
 from .audio import load_audio, resample_audio, transcribe_audio
 from .config import GenerationOutput, InferenceOptions, Reference, TadaConfig
+from .convert import collect_aligner_conv_keys, fold_weight_norm, rename_aligner_keys, transpose_conv_weights
 from .decoder import Decoder
 from .encoder import Encoder
 from .llm import KVCache, LlamaModel, build_rope_cache
-from .utils import decode_gray_code_to_time, normalize_text
+from .utils import SUPPORTED_LANGUAGES, SUPPORTED_LANGUAGES_SET, decode_gray_code_to_time, normalize_text
 from .vibevoice import VibeVoiceDiffusionHead, VibeVoiceDiffusionHeadConfig
 
 log = logging.getLogger("tada")
@@ -274,6 +275,7 @@ class TadaForCausalLM(nn.Module):
     def from_pretrained(
         cls,
         repo_id: str,
+        language: str | None = None,
         quantize: int | None = None,
         quantize_group_size: int = 64,
     ) -> "TadaForCausalLM":
@@ -283,6 +285,8 @@ class TadaForCausalLM(nn.Module):
 
         Args:
             repo_id: Hugging Face repo ID (e.g. "HumeAI/mlx-tada-3b").
+            language: Language code for the reference aligner. Uses `aligner-{language}`
+                when provided, otherwise defaults to `aligner` (English).
             quantize: Bit width for quantization (4 or 8). None for full precision (bf16).
             quantize_group_size: Group size for quantization. Default 64.
 
@@ -291,13 +295,82 @@ class TadaForCausalLM(nn.Module):
         """
         from huggingface_hub import snapshot_download
 
+        if language is not None:
+            language = language.lower()
+            if language not in SUPPORTED_LANGUAGES_SET:
+                supported = ", ".join(SUPPORTED_LANGUAGES)
+                raise ValueError(f"Unsupported language '{language}'. Supported languages: {supported}")
+
         weights_dir = snapshot_download(repo_id)
-        return cls.from_weights(weights_dir, quantize=quantize, quantize_group_size=quantize_group_size)
+
+        # HF MLX repos include the default English aligner. For multilingual alignment
+        # we mirror the PyTorch setup and fetch language-specific aligner weights from
+        # the codec repo.
+        if language is None:
+            return cls.from_weights(
+                weights_dir,
+                language=None,
+                quantize=quantize,
+                quantize_group_size=quantize_group_size,
+            )
+
+        model = cls.from_weights(
+            weights_dir,
+            language=None,
+            quantize=quantize,
+            quantize_group_size=quantize_group_size,
+        )
+        codec_snapshot = snapshot_download("HumeAI/tada-codec", allow_patterns=[f"aligner-{language}/*"])
+        aligner_dir = Path(codec_snapshot) / f"aligner-{language}"
+        converted_weights = aligner_dir / "weights.safetensors"
+        raw_weights = aligner_dir / "model.safetensors"
+
+        if not converted_weights.exists() and not raw_weights.exists():
+            raise FileNotFoundError(
+                f"Missing codec aligner weights in {aligner_dir}. Expected one of: "
+                f"{converted_weights}, {raw_weights}"
+            )
+
+        aligner = Aligner()
+        if converted_weights.exists():
+            load_weights(aligner, converted_weights)
+        else:
+            # Convert HF codec aligner tensors to MLX layout in-memory.
+            state: dict[str, np.ndarray] = {}
+            for k, v in mx.load(str(raw_weights)).items():
+                arr = v.astype(mx.float32) if v.dtype == mx.bfloat16 else v
+                state[k] = np.array(arr)
+            to_remove = [k for k in state if "masked_spec_embed" in k]
+
+            for k in to_remove:
+                del state[k]
+
+            state = fold_weight_norm(state)
+            state = rename_aligner_keys(state)
+            conv_keys = collect_aligner_conv_keys(state)
+            state = transpose_conv_weights(state, conv_keys)
+            pos_conv_key = "wav2vec2.encoder.pos_conv_embed.conv.weight"
+            if pos_conv_key in state and state[pos_conv_key].ndim == 3:
+                state[pos_conv_key] = np.swapaxes(state[pos_conv_key], 1, 2)
+
+            mlx_state = {}
+            for k, v in state.items():
+                arr = mx.array(v)
+                if arr.dtype in (mx.float32, mx.float64):
+                    arr = arr.astype(mx.bfloat16)
+                mlx_state[k] = arr
+
+            aligner.load_weights(list(mlx_state.items()), strict=False)
+
+        mx.eval(aligner.parameters())
+        model._aligner = aligner
+        return model
 
     @classmethod
     def from_weights(
         cls,
         weights_dir: str | Path,
+        language: str | None = None,
         quantize: int | None = None,
         quantize_group_size: int = 64,
     ) -> "TadaForCausalLM":
@@ -305,6 +378,8 @@ class TadaForCausalLM(nn.Module):
 
         Args:
             weights_dir: Path to the converted MLX weights directory.
+            language: Language code for the reference aligner. Uses `aligner-{language}`
+                when provided, otherwise defaults to `aligner` (English).
             quantize: Bit width for quantization (4 or 8). None for full precision (bf16).
                 Quantizes the LLM backbone and VibeVoice diffusion head.
             quantize_group_size: Group size for quantization. Default 64.
@@ -313,6 +388,12 @@ class TadaForCausalLM(nn.Module):
             A fully initialized TadaForCausalLM ready for inference.
         """
         weights_dir = Path(weights_dir)
+        if language is not None:
+            language = language.lower()
+            if language not in SUPPORTED_LANGUAGES_SET:
+                supported = ", ".join(SUPPORTED_LANGUAGES)
+                raise ValueError(f"Unsupported language '{language}'. Supported languages: {supported}")
+
         model_dir = weights_dir / "model"
         config_path = model_dir / "config.json"
 
@@ -349,8 +430,22 @@ class TadaForCausalLM(nn.Module):
         load_weights(decoder, weights_dir / "decoder" / "weights.safetensors")
         mx.eval(decoder.parameters())
         model._decoder = decoder
+
+        aligner_subdir = f"aligner-{language}" if language else "aligner"
+        aligner_weights = weights_dir / aligner_subdir / "weights.safetensors"
+        if not aligner_weights.exists():
+            if language is None:
+                raise FileNotFoundError(f"Missing aligner weights: {aligner_weights}")
+
+            default_aligner = weights_dir / "aligner" / "weights.safetensors"
+            raise FileNotFoundError(
+                f"Missing aligner weights for language '{language}': {aligner_weights}. "
+                f"Expected converted multilingual aligners under '{weights_dir}'. "
+                f"If you only have English weights, use language=None (default), which looks for {default_aligner}."
+            )
+
         aligner = Aligner()
-        load_weights(aligner, weights_dir / "aligner" / "weights.safetensors")
+        load_weights(aligner, aligner_weights)
         mx.eval(aligner.parameters())
         model._aligner = aligner
         model._tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.2-1B")

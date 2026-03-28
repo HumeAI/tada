@@ -90,6 +90,18 @@ save_wav(out.audio, "output.wav")
 # out.num_tokens
 ```
 
+Supported language codes for `language`: `ar`, `ch`, `de`, `es`, `fr`, `it`, `ja`, `pl`, `pt`.
+When omitted, MLX-TADA loads the default English aligner (`aligner`).
+
+For multilingual alignment, pass `language` when loading weights (Python) or `--language` (CLI):
+```python
+model = TadaForCausalLM.from_pretrained("HumeAI/mlx-tada-3b", language="ja", quantize=4)
+```
+
+```bash
+uv run python -m mlx_tada.generate --weights ./weights/3b --audio samples/ja_prompt.wav --language ja --audio-text "このムキムキのお兄さんがいるし バーだし少し高そうだと思いますよねこのバーの料金設定は良心的でした まあそんなに高くなかったです" --text "今日はとても良い天気ですね。散歩に行きましょう。"
+```
+
 ### Inference Options
 
 Control generation behavior with `InferenceOptions`:

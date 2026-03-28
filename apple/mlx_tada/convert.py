@@ -5,6 +5,8 @@ from pathlib import Path
 import mlx.core as mx
 import numpy as np
 
+from .utils import SUPPORTED_LANGUAGES
+
 try:
     from safetensors import safe_open
 except ImportError:
@@ -424,6 +426,7 @@ def convert_aligner(
     codec_path: str,
     output_path: str,
     subfolder: str = "aligner",
+    output_subfolder: str = "aligner",
 ) -> None:
     aligner_path = Path(codec_path) / subfolder if (Path(codec_path) / subfolder).exists() else Path(codec_path)
     print(f"Loading Aligner weights from {aligner_path}")
@@ -447,7 +450,7 @@ def convert_aligner(
         pos_conv_weight = state[pos_conv_key]
         state[pos_conv_key] = np.swapaxes(pos_conv_weight, 1, 2)
 
-    out_dir = Path(output_path) / "aligner"
+    out_dir = Path(output_path) / output_subfolder
     out_dir.mkdir(parents=True, exist_ok=True)
     save_as_bfloat16(state, str(out_dir / "weights.safetensors"))
     print(f"  Saved {len(state)} tensors to {out_dir / 'weights.safetensors'}")
@@ -495,4 +498,12 @@ def convert_all(model_repo: str, codec_repo: str, output: Path) -> None:
     convert_encoder(codec_path, str(output))
     convert_decoder(codec_path, str(output))
     convert_aligner(codec_path, str(output))
+    codec_root = Path(codec_path)
+
+    for language in SUPPORTED_LANGUAGES:
+        subfolder = f"aligner-{language}"
+        aligner_dir = codec_root / subfolder
+        if aligner_dir.exists():
+            convert_aligner(codec_path, str(output), subfolder=subfolder, output_subfolder=subfolder)
+
     print(f"\nAll conversions complete! Weights saved to: {output}")

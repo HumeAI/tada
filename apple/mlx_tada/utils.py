@@ -6,7 +6,12 @@ __all__ = [
     "normalize_text",
     "gray_code_to_int",
     "decode_gray_code_to_time",
+    "SUPPORTED_LANGUAGES",
+    "SUPPORTED_LANGUAGES_SET",
 ]
+
+SUPPORTED_LANGUAGES: tuple[str, ...] = ("ar", "ch", "de", "es", "fr", "it", "ja", "pl", "pt")
+SUPPORTED_LANGUAGES_SET = frozenset(SUPPORTED_LANGUAGES)
 
 
 def normalize_text(text: str) -> str:
