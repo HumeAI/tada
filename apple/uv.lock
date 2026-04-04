@@ -463,6 +463,7 @@ name = "mlx-tada"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "huggingface-hub" },
     { name = "mlx" },
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "numpy", version = "2.4.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
@@ -481,6 +482,7 @@ convert = [
 
 [package.metadata]
 requires-dist = [
+    { name = "huggingface-hub", specifier = ">=0.20.0" },
     { name = "huggingface-hub", marker = "extra == 'convert'", specifier = ">=0.20.0" },
     { name = "mlx", specifier = ">=0.30.0" },
     { name = "numpy", specifier = ">=1.24.0" },
