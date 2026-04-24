@@ -653,6 +653,7 @@ class TadaForCausalLM(LlamaForCausalLM):
         use_text_in_prompt: bool = False,
         verbose: bool = False,
         return_logits: bool = False,
+        attention_mask: torch.LongTensor | None = None,
         **kwargs,
     ) -> SyncTokGenerationOutput:
         start_header_id = self.tokenizer.convert_tokens_to_ids("<|start_header_id|>")
@@ -689,6 +690,13 @@ class TadaForCausalLM(LlamaForCausalLM):
             print("Prompt:", self.tokenizer.decode(input_ids[0]))
 
         opts = inference_options
+
+        if attention_mask is None:
+            attention_mask = torch.ones_like(input_ids)
+        max_input_len = input_ids.shape[1]
+        last_real_positions = (attention_mask.long().sum(dim=1) - 1).clamp(min=0)
+        cumulative_mask = attention_mask.clone()
+
         acoustic_features = torch.zeros(input_ids.shape[0], 1, self.config.acoustic_dim, device=input_ids.device)
         acoustic_masks = torch.zeros(input_ids.shape[0], 1, device=input_ids.device, dtype=torch.long)
         time_len_before = torch.zeros(input_ids.shape[0], 1, device=input_ids.device, dtype=torch.long)
@@ -701,7 +709,7 @@ class TadaForCausalLM(LlamaForCausalLM):
         )
 
         generation_config, model_kwargs = self._prepare_generation_config(generation_config, True)
-        self._prepare_cache_for_generation(generation_config, model_kwargs, None, 1, num_steps)
+        self._prepare_cache_for_generation(generation_config, model_kwargs, None, input_ids.shape[0], num_steps)
         model_kwargs["cache_position"] = torch.arange(1, device=input_ids.device, dtype=torch.long)
 
         all_acoustic_features: list[torch.FloatTensor] = []
@@ -781,8 +789,17 @@ class TadaForCausalLM(LlamaForCausalLM):
                 )
                 combined_embeds = torch.cat([combined_embeds, text_only_prefill], dim=0)
 
+            prefill_mask = cumulative_mask[:, :prefill_len]
+            if need_neg_batch:
+                prefill_mask_combined = torch.cat([prefill_mask, prefill_mask], dim=0)
+            else:
+                prefill_mask_combined = prefill_mask
+            if use_text_only_logit_scale:
+                prefill_mask_combined = torch.cat([prefill_mask_combined, prefill_mask], dim=0)
+
             prefill_outputs = self.model(
                 inputs_embeds=combined_embeds,
+                attention_mask=prefill_mask_combined,
                 use_cache=True,
                 past_key_values=None,
                 cache_position=torch.arange(prefill_len, device=input_ids.device),
@@ -877,6 +894,8 @@ class TadaForCausalLM(LlamaForCausalLM):
                 "acoustic_feat_norm": 0.0,
             })
         last_time_before = None
+        finished = torch.zeros(input_ids.shape[0], dtype=torch.bool, device=input_ids.device)
+        eos_token_id_val = self.tokenizer.eos_token_id
         for step in range(step_start, num_steps):
             # When step >= input_ids.shape[1] we are generating; use last token as input for forward
             input_slice = input_ids[:, step : step + 1] if step < input_ids.shape[1] else input_ids[:, -1:]
@@ -901,6 +920,38 @@ class TadaForCausalLM(LlamaForCausalLM):
 
             need_logits = return_logits or step >= input_ids.shape[1] - 1
 
+            f3 = finished.view(-1, 1, 1)
+            f2 = finished.view(-1, 1)
+            acoustic_features = torch.where(f3, torch.zeros_like(acoustic_features), acoustic_features)
+            acoustic_masks = torch.where(f2, torch.zeros_like(acoustic_masks), acoustic_masks)
+            time_len_before = torch.where(f2, torch.zeros_like(time_len_before), time_len_before)
+            time_len_after = torch.where(f2, torch.zeros_like(time_len_after), time_len_after)
+
+            if step < input_ids.shape[1]:
+                finished = finished | (input_ids[:, step] == eos_token_id_val)
+
+            if cumulative_mask.shape[1] < step + 1:
+                cumulative_mask = torch.cat(
+                    [
+                        cumulative_mask,
+                        torch.ones(
+                            cumulative_mask.shape[0],
+                            1,
+                            dtype=cumulative_mask.dtype,
+                            device=cumulative_mask.device,
+                        ),
+                    ],
+                    dim=1,
+                )
+            step_mask_base = cumulative_mask[:, : step + 1]
+
+            # Explicit RoPE positions so right-padded samples see L_i+k, not max_len+k.
+            if step >= max_input_len:
+                gen_offset = step - max_input_len
+                step_position_ids_base = (last_real_positions + 1 + gen_offset).unsqueeze(1)
+            else:
+                step_position_ids_base = None
+
             if need_neg_batch:
                 is_structural = (
                     (input_slice == start_header_id) | (input_slice == end_header_id) | (input_slice == eot_id)
@@ -919,6 +970,15 @@ class TadaForCausalLM(LlamaForCausalLM):
                     combined_time_before = torch.cat([combined_time_before, torch.zeros_like(time_len_before)], dim=0)
                     combined_time_after = torch.cat([combined_time_after, torch.zeros_like(time_len_after)], dim=0)
                 model_inputs = self.prepare_inputs_for_generation(combined_slice, **model_kwargs)
+                step_mask_fwd = torch.cat([step_mask_base, step_mask_base], dim=0)
+                if use_text_only_logit_scale:
+                    step_mask_fwd = torch.cat([step_mask_fwd, step_mask_base], dim=0)
+                model_inputs["attention_mask"] = step_mask_fwd
+                if step_position_ids_base is not None:
+                    step_pos_fwd = torch.cat([step_position_ids_base, step_position_ids_base], dim=0)
+                    if use_text_only_logit_scale:
+                        step_pos_fwd = torch.cat([step_pos_fwd, step_position_ids_base], dim=0)
+                    model_inputs["position_ids"] = step_pos_fwd
                 outputs = self.forward_one_step(
                     **model_inputs,
                     acoustic_features=combined_acoustic,
@@ -937,6 +997,11 @@ class TadaForCausalLM(LlamaForCausalLM):
                     combined_time_before = torch.cat([time_len_before, torch.zeros_like(time_len_before)], dim=0)
                     combined_time_after = torch.cat([time_len_after, torch.zeros_like(time_len_after)], dim=0)
                     model_inputs = self.prepare_inputs_for_generation(combined_slice, **model_kwargs)
+                    model_inputs["attention_mask"] = torch.cat([step_mask_base, step_mask_base], dim=0)
+                    if step_position_ids_base is not None:
+                        model_inputs["position_ids"] = torch.cat(
+                            [step_position_ids_base, step_position_ids_base], dim=0
+                        )
                     outputs = self.forward_one_step(
                         **model_inputs,
                         acoustic_features=combined_acoustic,
@@ -948,6 +1013,9 @@ class TadaForCausalLM(LlamaForCausalLM):
                     )
                 else:
                     model_inputs = self.prepare_inputs_for_generation(input_slice, **model_kwargs)
+                    model_inputs["attention_mask"] = step_mask_base
+                    if step_position_ids_base is not None:
+                        model_inputs["position_ids"] = step_position_ids_base
                     outputs = self.forward_one_step(
                         **model_inputs,
                         acoustic_features=acoustic_features,
@@ -1005,10 +1073,10 @@ class TadaForCausalLM(LlamaForCausalLM):
             time_len_gray_code = speech[..., -self.time_dim :]
             predicted_time_len_before = decode_gray_code_to_time(
                 time_len_gray_code[..., : self.num_time_bits], self.num_time_bits
-            ).unsqueeze(0)
+            ).unsqueeze(-1)
             predicted_time_len_after = decode_gray_code_to_time(
                 time_len_gray_code[..., self.num_time_bits :], self.num_time_bits
-            ).unsqueeze(0)
+            ).unsqueeze(-1)
 
             if all_logits is not None:
                 all_logits.append(logits)
@@ -1076,7 +1144,7 @@ class TadaForCausalLM(LlamaForCausalLM):
                     acoustic_feat_type = "prompted"
                     acoustic_masks = prompt_acoustic_masks[:, step - self.config.shift_acoustic].unsqueeze(1)
                 else:
-                    acoustic_features = speech.unsqueeze(0)
+                    acoustic_features = speech.unsqueeze(1)
                     acoustic_feat_type = "predicted"
                     acoustic_masks = torch.ones(input_ids.shape[0], 1, device=input_ids.device, dtype=torch.long)
                     acoustic_features = (
@@ -1212,18 +1280,24 @@ class TadaForCausalLM(LlamaForCausalLM):
         if isinstance(text, str):
             text = [text]
         text = [normalize_text_fn(t) if normalize_text else t for t in text]
-        input_ids = [
-            self.tokenizer.encode(prompt.text[0] + text[i])[prompt.text_tokens_len[i] :] for i in range(len(text))
-        ]
+        B = len(text)
         audio_feat_len = (prompt.audio_len / prompt.sample_rate * 50).ceil().long()
 
-        text_tokens = [
-            self.tokenizer.encode(prompt.text[0], add_special_tokens=False)
-            + self.tokenizer.encode(text[0], add_special_tokens=False)
-        ]
-        input_ids, input_lengths = self._add_bos_eos(
-            torch.tensor(text_tokens, device=self.device),
-            torch.tensor([len(token) for token in text_tokens], device=self.device),
+        pad_id = self.tokenizer.convert_tokens_to_ids("<|finetune_right_pad_id|>")
+        prompt_text = prompt.text[0]
+        prompt_ends_space = bool(prompt_text) and prompt_text[-1].isspace()
+
+        sample_seqs = []
+        for t in text:
+            # Joint-encode with a seam space so BPE doesn't merge across the prompt/gen boundary.
+            sep = "" if prompt_ends_space or not t or t[0].isspace() else " "
+            joint_ids = self.tokenizer.encode(prompt_text + sep + t, add_special_tokens=False)
+            sample_seqs.append([self.sos_id] + joint_ids + [self.eos_id] * self.num_eos_tokens)
+        input_lengths = torch.tensor([len(seq) for seq in sample_seqs], device=self.device)
+        max_len = int(input_lengths.max().item())
+        input_ids = torch.tensor(
+            [seq + [pad_id] * (max_len - len(seq)) for seq in sample_seqs],
+            device=self.device,
         )
 
         token_positions = prompt.token_positions
@@ -1242,7 +1316,7 @@ class TadaForCausalLM(LlamaForCausalLM):
         time_len_before = time_gaps[:, :-1]
         time_len_after = time_gaps[:, 1:]
 
-        prompt_acoustic_features = prompt.token_values
+        prompt_acoustic_features = prompt.token_values.expand(B, -1, -1)
         prompt_acoustic_masks = torch.ones(
             prompt_acoustic_features.shape[:2], device=prompt_acoustic_features.device, dtype=torch.long
         )
@@ -1259,8 +1333,9 @@ class TadaForCausalLM(LlamaForCausalLM):
             self.device
         )
         prefix_len = prefix_text_tokens.shape[1]
+        prefix_text_tokens = prefix_text_tokens.expand(B, -1)
         input_ids = torch.cat([input_ids[:, :1], prefix_text_tokens, input_ids[:, 1:]], dim=1)
-        input_lengths = input_lengths + len(prefix_text_tokens)
+        input_lengths = input_lengths + prefix_len
         prompt_acoustic_features = torch.nn.functional.pad(prompt_acoustic_features, (0, 0, prefix_len, 0))
         prompt_acoustic_masks = torch.nn.functional.pad(prompt_acoustic_masks, (prefix_len, 0))
         time_len_before = torch.nn.functional.pad(time_len_before, (prefix_len, 0))
@@ -1272,10 +1347,13 @@ class TadaForCausalLM(LlamaForCausalLM):
             time_len_before = time_len_before[:, :-num_transition_steps]
             time_len_after = time_len_after[:, :-num_transition_steps]
 
+        attention_mask = (input_ids != pad_id).long()
+
         outputs: SyncTokGenerationOutput = self._generate(
             input_ids=input_ids,
             text=text,
             input_lengths=input_lengths,
+            attention_mask=attention_mask,
             prompt_acoustic_features=prompt_acoustic_features,
             prompt_acoustic_masks=torch.cat(
                 [prompt_acoustic_masks[:, 1:], torch.ones_like(prompt_acoustic_masks[:, :1])], -1
@@ -1292,12 +1370,27 @@ class TadaForCausalLM(LlamaForCausalLM):
 
         encoded = acoustic_features[..., num_prompt_tokens + num_transition_steps - 1 :, :]
         time_before = outputs.time_before[..., num_prompt_tokens + num_transition_steps - 1 :]
-        wavs = []
 
+        is_pad = input_ids == pad_id
+        any_pad = is_pad.any(dim=1)
+        first_pad = is_pad.long().argmax(dim=1)
+        real_token_lens = torch.where(
+            any_pad, first_pad, torch.full_like(first_pad, input_ids.shape[1])
+        )
+        start_offset = num_prompt_tokens + num_transition_steps - 1
+        # encoded[j] maps to step (j + start_offset + shift_acoustic).
+        end_frames = (real_token_lens - start_offset - self.config.shift_acoustic).clamp(
+            min=0, max=encoded.shape[1]
+        )
+
+        wavs = []
         for i in range(encoded.shape[0]):
+            e = int(end_frames[i].item())
             try:
-                wav = self._decode_wav(encoded[i], time_before=time_before[i]).squeeze(0, 1)
-                wav = wav[..., int(24000 * time_before[i][0] / 50) :]  # remove leading silence
+                enc_i = encoded[i, :e]
+                tb_i = time_before[i, :e]
+                wav = self._decode_wav(enc_i, time_before=tb_i).squeeze(0, 1)
+                wav = wav[..., int(24000 * tb_i[0] / 50) :]  # remove leading silence
                 wavs.append(wav)
             except Exception:
                 wavs.append(None)
