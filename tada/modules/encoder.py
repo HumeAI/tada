@@ -334,6 +334,104 @@ class LocalSelfAttention(torch.nn.Module):
 
         return output
 
+    def _apply_rope_with_offset(self, x: torch.Tensor, seq_len: int, offset: int) -> torch.Tensor:
+        """Apply RoPE starting at a given position offset.
+
+        Args:
+            x: (batch, num_heads, seq_len, head_dim)
+            seq_len: number of new positions
+            offset: absolute position of the first frame
+        Returns:
+            rotated x with same shape
+        """
+        batch, num_heads, _, head_dim = x.shape
+
+        freqs = self.rope_freqs[offset : offset + seq_len]  # (seq_len, head_dim // 2, 2)
+        freqs_cos = freqs[..., 0]
+        freqs_sin = freqs[..., 1]
+
+        x_reshaped = x.reshape(batch, num_heads, seq_len, head_dim // 2, 2)
+        x0 = x_reshaped[..., 0]
+        x1 = x_reshaped[..., 1]
+
+        x_rotated_0 = x0 * freqs_cos.unsqueeze(0).unsqueeze(0) - x1 * freqs_sin.unsqueeze(0).unsqueeze(0)
+        x_rotated_1 = x0 * freqs_sin.unsqueeze(0).unsqueeze(0) + x1 * freqs_cos.unsqueeze(0).unsqueeze(0)
+
+        x_rotated = torch.stack([x_rotated_0, x_rotated_1], dim=-1)
+        return x_rotated.reshape(batch, num_heads, seq_len, head_dim)
+
+    def forward_with_cache(
+        self,
+        x: torch.Tensor,
+        cached_k: torch.Tensor | None,
+        cached_v: torch.Tensor | None,
+        position_offset: int = 0,
+        mask: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Forward with KV-cache. Returns (output, new_k, new_v).
+
+        Args:
+            x: (batch, new_len, d_model) — new frames only
+            cached_k: (batch, num_heads, cached_len, head_dim) or None
+            cached_v: (batch, num_heads, cached_len, head_dim) or None
+            position_offset: absolute position of first new frame (for RoPE)
+            mask: (batch, new_len, total_len) attention mask, True=masked
+
+        Returns:
+            output: (batch, new_len, d_model)
+            new_k: (batch, num_heads, new_len, head_dim) — post-RoPE, append to cache
+            new_v: (batch, num_heads, new_len, head_dim) — append to cache
+        """
+        batch_size, new_len, d_model = x.shape
+
+        # Compute Q, K, V from new frames only
+        qkv = self.qkv(x)
+        qkv = qkv.reshape(batch_size, new_len, 3, self.num_heads, self.head_dim)
+        qkv = qkv.permute(2, 0, 3, 1, 4)  # (3, batch, num_heads, new_len, head_dim)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+
+        # Apply RoPE with correct absolute positions
+        q = self._apply_rope_with_offset(q, new_len, position_offset)
+        k = self._apply_rope_with_offset(k, new_len, position_offset)
+
+        # Save new K, V for caching (post-RoPE K, pre-attention V)
+        new_k = k
+        new_v = v
+
+        # Concatenate with cached K, V
+        if cached_k is not None:
+            full_k = torch.cat([cached_k, k], dim=2)  # (batch, heads, cached+new, head_dim)
+            full_v = torch.cat([cached_v, v], dim=2)
+        else:
+            full_k = k
+            full_v = v
+
+        # Compute attention: Q (new) × K (all)
+        attn_scores = torch.matmul(q, full_k.transpose(-2, -1)) / math.sqrt(self.head_dim)
+        # (batch, num_heads, new_len, total_len)
+
+        # Apply mask
+        if mask is not None:
+            if mask.dim() == 3:
+                # (batch, new_len, total_len) -> broadcast to heads
+                attn_scores = attn_scores.masked_fill(mask.unsqueeze(1), float("-inf"))
+            elif mask.dim() == 2:
+                attn_scores = attn_scores.masked_fill(mask.unsqueeze(0).unsqueeze(0), float("-inf"))
+
+        attn_weights = torch.softmax(attn_scores, dim=-1)
+        attn_weights = self.dropout(attn_weights)
+
+        # Apply attention to values
+        attn_output = torch.matmul(attn_weights, full_v)  # (batch, heads, new_len, head_dim)
+        attn_output = attn_output.transpose(1, 2).reshape(batch_size, new_len, d_model)
+
+        # Output projection + residual + norm (same as forward)
+        output = self.out_proj(attn_output)
+        output = self.dropout(output)
+        output = self.layer_norm(x + output)
+
+        return output, new_k, new_v
+
 
 class LocalAttentionEncoderLayer(torch.nn.Module):
     """Transformer encoder layer with local self-attention and feed-forward network."""
@@ -392,6 +490,35 @@ class LocalAttentionEncoderLayer(torch.nn.Module):
         x = self.norm(x + self.ffn(x))
 
         return x
+
+    def forward_with_cache(
+        self,
+        x: torch.Tensor,
+        cached_k: torch.Tensor | None,
+        cached_v: torch.Tensor | None,
+        position_offset: int = 0,
+        mask: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Forward with KV-cache for streaming decoding.
+
+        Args:
+            x: (batch, new_len, d_model) — new frames only
+            cached_k, cached_v: per-layer KV cache tensors or None
+            position_offset: absolute position of first new frame
+            mask: (batch, new_len, total_len) attention mask
+
+        Returns:
+            output: (batch, new_len, d_model)
+            new_k: (batch, num_heads, new_len, head_dim) — to append to cache
+            new_v: (batch, num_heads, new_len, head_dim)
+        """
+        # Self-attention with cache (includes residual + norm)
+        x, new_k, new_v = self.self_attn.forward_with_cache(
+            x, cached_k, cached_v, position_offset, mask
+        )
+        # FFN block with residual + norm (same as forward)
+        x = self.norm(x + self.ffn(x))
+        return x, new_k, new_v
 
 
 class LocalAttentionEncoder(torch.nn.Module):

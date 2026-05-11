@@ -1,7 +1,7 @@
 import math
 import time
 from dataclasses import dataclass, replace
-from typing import Literal, Optional
+from typing import Generator, Literal, Optional
 
 import torch
 from transformers import AutoTokenizer, LlamaForCausalLM
@@ -15,7 +15,7 @@ from ..nn.vibevoice import VibeVoiceDiffusionHead, VibeVoiceDiffusionHeadConfig
 from ..utils.gray_code import decode_gray_code_to_time
 from ..utils.text import normalize_text as normalize_text_fn
 from .acoustic_spkr_verf import AcousticSpkrVerf
-from .decoder import Decoder, DecoderConfig
+from .decoder import Decoder, DecoderConfig, StreamingDecoder
 from .encoder import Encoder, EncoderConfig, EncoderOutput
 
 
@@ -120,6 +120,104 @@ class GenerationOutput(ModelOutput):
     logits: torch.FloatTensor | None = None
     step_logs: list[dict] | None = None
 
+
+
+@dataclass
+class StepOutput:
+    """Single predicted token output, yielded by _generate() for streaming."""
+    acoustic_features: "torch.Tensor"
+    time_before: "torch.Tensor"
+
+
+class AudioStream:
+    """Iterator that yields audio chunks during streaming generation.
+
+    Usage:
+        stream = model.generate(prompt=prompt, text="Hello", stream=True)
+        for chunk, sample_rate in stream:
+            play(chunk)
+        output = stream.result  # GenerationOutput, available after iteration
+    """
+
+    def __init__(
+        self,
+        gen: "Generator",
+        decoder: "Decoder",
+        acoustic_mean: float,
+        acoustic_std: float,
+        cnn_window_size: int = 100,
+    ):
+        self._gen = gen
+        self._decoder = decoder
+        self._acoustic_mean = acoustic_mean
+        self._acoustic_std = acoustic_std
+        self._cnn_window_size = cnn_window_size
+        self.result: "GenerationOutput | None" = None
+
+    def __iter__(self):
+        streaming_decoder = StreamingDecoder(
+            self._decoder,
+            min_block_frames=3,
+            cnn_window_size=self._cnn_window_size,
+        )
+        first_token_seen = False
+
+        for step_output in self._gen:
+            if isinstance(step_output, SyncTokGenerationOutput):
+                # Final yield — flush remaining audio
+                all_tb = step_output.time_before
+                trailing = int(all_tb[0, -1].item()) if all_tb.shape[1] > 0 else 0
+                final_chunk = streaming_decoder.flush(trailing_frames=trailing)
+                if final_chunk is not None and final_chunk.shape[-1] > 0:
+                    yield final_chunk, 24000
+                # Build .result so caller can access full GenerationOutput
+                self._build_result(step_output)
+                return
+
+            # Denormalize acoustic features
+            feat = step_output.acoustic_features * self._acoustic_std + self._acoustic_mean
+            tb_val = step_output.time_before[0].item()  # (batch, 1) -> scalar
+
+            # Skip leading silence on first token
+            if not first_token_seen:
+                first_token_seen = True
+                leading_frames = max(int(tb_val), 5)
+                streaming_decoder.skip_leading_frames(leading_frames)
+
+            chunk = streaming_decoder.decode_block(feat[0, 0], tb_val)
+            if chunk is not None and chunk.shape[-1] > 0:
+                yield chunk, 24000
+
+    def _build_result(self, outputs: "SyncTokGenerationOutput"):
+        """Build GenerationOutput from the final SyncTokGenerationOutput."""
+        ctx = self._generate_context
+        acoustic_features = outputs.acoustic_features * ctx["acoustic_std"] + ctx["acoustic_mean"]
+        token_decode_offset = ctx["token_decode_offset"]
+        encoded = acoustic_features[..., token_decode_offset:, :]
+        time_before = outputs.time_before[..., token_decode_offset:]
+        text = ctx["text"]
+        input_ids = ctx["input_ids"]
+        tokenizer = ctx["tokenizer"]
+
+        # Concatenate all streamed audio for .result
+        # (AudioStream doesn't store chunks — caller should collect them)
+        self.result = GenerationOutput(
+            audio=None,
+            text=text,
+            input_text_ids=input_ids,
+            input_str=[tokenizer.decode(input_ids[i]) for i in range(input_ids.shape[0])] if tokenizer else None,
+            output_str=[
+                tokenizer.decode(outputs.text_token_ids[i]) for i in range(outputs.text_token_ids.shape[0])
+            ] if tokenizer and outputs.text_token_ids is not None else None,
+            output_text_ids=outputs.text_token_ids,
+            acoustic_features=acoustic_features,
+            time_before=time_before,
+            prompt_text_tokens=input_ids,
+            llm_time=outputs.llm_time,
+            diffusion_time=outputs.diffusion_time,
+            logits=outputs.logits,
+            step_logs=outputs.step_logs,
+        )
 
 class CausalLMOutputWithPast(CausalLMOutputWithPastBase):
     def __init__(
@@ -654,7 +752,7 @@ class TadaForCausalLM(LlamaForCausalLM):
         verbose: bool = False,
         return_logits: bool = False,
         **kwargs,
-    ) -> SyncTokGenerationOutput:
+    ) -> Generator[StepOutput | SyncTokGenerationOutput, None, None]:
         start_header_id = self.tokenizer.convert_tokens_to_ids("<|start_header_id|>")
         end_header_id = self.tokenizer.convert_tokens_to_ids("<|end_header_id|>")
         eot_id = self.tokenizer.convert_tokens_to_ids("<|eot_id|>")
@@ -1099,6 +1197,14 @@ class TadaForCausalLM(LlamaForCausalLM):
                     time_len_after = predicted_time_len_after
                 all_time_before.append(time_len_before)
                 last_time_before = time_len_before
+
+                # Yield predicted tokens for streaming
+                if acoustic_feat_type == "predicted":
+                    yield StepOutput(
+                        acoustic_features=acoustic_features,
+                        time_before=time_len_before,
+                    )
+
             model_kwargs = self._update_model_kwargs_for_generation(outputs, model_kwargs)
             if log_time:
                 if torch.cuda.is_available():
@@ -1133,7 +1239,7 @@ class TadaForCausalLM(LlamaForCausalLM):
             second_pass_time_after = torch.cat([scaled_time, torch.ones_like(scaled_time[:, :1])], dim=1)
 
             second_pass_options = replace(inference_options, speed_up_factor=None)
-            return self._generate(
+            yield from self._generate(
                 input_ids=input_ids,
                 input_lengths=input_lengths,
                 prompt_acoustic_features=prompt_acoustic_features,
@@ -1147,8 +1253,9 @@ class TadaForCausalLM(LlamaForCausalLM):
                 return_logits=return_logits,
                 **kwargs,
             )
+            return
 
-        return SyncTokGenerationOutput(
+        yield SyncTokGenerationOutput(
             text_token_ids=torch.cat(all_output_token_ids, dim=1) if len(all_output_token_ids) > 0 else None,
             acoustic_features=torch.cat([f if f.ndim == 3 else f.unsqueeze(1) for f in all_acoustic_features], dim=1),
             time_before=torch.cat([f if f.ndim == 2 else f.unsqueeze(1) for f in all_time_before], dim=1),
@@ -1201,7 +1308,9 @@ class TadaForCausalLM(LlamaForCausalLM):
         use_text_in_prompt: bool = False,
         normalize_text: bool = True,
         verbose: bool = False,
-    ) -> GenerationOutput:
+        stream: bool = False,
+        streaming_cnn_window_size: int = 100,
+    ) -> "GenerationOutput | AudioStream":
         # Auto-cast prompt tensors to model dtype (e.g. fp32 prompt + bf16 model)
         model_dtype = next(self.parameters()).dtype
         for field in prompt.__dataclass_fields__:
@@ -1212,14 +1321,21 @@ class TadaForCausalLM(LlamaForCausalLM):
         if isinstance(text, str):
             text = [text]
         text = [normalize_text_fn(t) if normalize_text else t for t in text]
-        input_ids = [
-            self.tokenizer.encode(prompt.text[0] + text[i])[prompt.text_tokens_len[i] :] for i in range(len(text))
-        ]
         audio_feat_len = (prompt.audio_len / prompt.sample_rate * 50).ceil().long()
 
+        # Joint encoding with a space separator ensures correct BPE tokenization
+        # at the prompt/gen boundary. Without a space, BPE merges boundary chars
+        # (e.g., ".Hello" -> ".H"+"ello", losing the "H" from "Hello").
+        # The space ensures the first generation token is tokenized correctly.
+        prompt_text = prompt.text[0]
+        gen_text = text[0]
+        # Add space if prompt doesn't end with whitespace and gen doesn't start with it
+        if prompt_text and gen_text and not prompt_text[-1].isspace() and not gen_text[0].isspace():
+            joint_text = prompt_text + " " + gen_text
+        else:
+            joint_text = prompt_text + gen_text
         text_tokens = [
-            self.tokenizer.encode(prompt.text[0], add_special_tokens=False)
-            + self.tokenizer.encode(text[0], add_special_tokens=False)
+            self.tokenizer.encode(joint_text, add_special_tokens=False)
         ]
         input_ids, input_lengths = self._add_bos_eos(
             torch.tensor(text_tokens, device=self.device),
@@ -1272,7 +1388,11 @@ class TadaForCausalLM(LlamaForCausalLM):
             time_len_before = time_len_before[:, :-num_transition_steps]
             time_len_after = time_len_after[:, :-num_transition_steps]
 
-        outputs: SyncTokGenerationOutput = self._generate(
+        num_prompt_tokens = prompt_acoustic_features.shape[1]
+        # Token offset: generated tokens start after prompt + transition tokens
+        token_decode_offset = num_prompt_tokens + num_transition_steps - 1
+
+        gen = self._generate(
             input_ids=input_ids,
             text=text,
             input_lengths=input_lengths,
@@ -1287,17 +1407,42 @@ class TadaForCausalLM(LlamaForCausalLM):
             use_text_in_prompt=use_text_in_prompt,
         )
 
-        num_prompt_tokens = prompt_acoustic_features.shape[1]
-        acoustic_features = outputs.acoustic_features * self.config.acoustic_std + self.config.acoustic_mean
+        if stream:
+            audio_stream = AudioStream(
+                gen=gen,
+                decoder=self.decoder,
+                acoustic_mean=self.config.acoustic_mean,
+                acoustic_std=self.config.acoustic_std,
+                cnn_window_size=streaming_cnn_window_size,
+            )
+            # Stash info needed to build GenerationOutput after iteration
+            audio_stream._generate_context = {
+                "text": text,
+                "input_ids": input_ids,
+                "token_decode_offset": token_decode_offset,
+                "tokenizer": self.tokenizer,
+                "acoustic_std": self.config.acoustic_std,
+                "acoustic_mean": self.config.acoustic_mean,
+            }
+            return audio_stream
 
-        encoded = acoustic_features[..., num_prompt_tokens + num_transition_steps - 1 :, :]
-        time_before = outputs.time_before[..., num_prompt_tokens + num_transition_steps - 1 :]
+        # Non-streaming: drain generator eagerly
+        for step in gen:
+            outputs = step
+        assert isinstance(outputs, SyncTokGenerationOutput)
+
+        acoustic_features = outputs.acoustic_features * self.config.acoustic_std + self.config.acoustic_mean
+        encoded = acoustic_features[..., token_decode_offset:, :]
+        time_before = outputs.time_before[..., token_decode_offset:]
         wavs = []
 
         for i in range(encoded.shape[0]):
             try:
                 wav = self._decode_wav(encoded[i], time_before=time_before[i]).squeeze(0, 1)
-                wav = wav[..., int(24000 * time_before[i][0] / 50) :]  # remove leading silence
+                # Trim leading silence. Clamp to at least 5 frames (100ms)
+                # to avoid transition artifacts when time_before[0] is very small.
+                min_trim_frames = max(int(time_before[i][0].item()), 5)
+                wav = wav[..., min_trim_frames * 480 :]
                 wavs.append(wav)
             except Exception:
                 wavs.append(None)

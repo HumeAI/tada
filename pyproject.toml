@@ -40,6 +40,9 @@ extend-select = ["I"]
 
 [tool.pytest.ini_options]
 log_cli_level = "DEBUG"
+markers = [
+    "integration: integration tests requiring GPU and model weights (deselected by default)",
+]
 
 [tool.uv.sources]
 # descript-audiotools = { index = "humepy" }
