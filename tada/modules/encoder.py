@@ -556,7 +556,7 @@ class LocalAttentionEncoder(torch.nn.Module):
 class EncoderConfig(PretrainedConfig):
     hidden_dim: int = 1024
     embed_dim: int = 512
-    strides: list[int] = [6, 5, 4, 4]
+    strides: tuple[int, ...] = (6, 5, 4, 4)
     num_attn_layers: int = 6
     num_attn_heads: int = 8
     attn_dim_feedforward: int = 4096
