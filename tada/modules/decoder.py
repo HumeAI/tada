@@ -171,7 +171,7 @@ class DecoderConfig(PretrainedConfig):
     attn_dropout: float = 0.1
     use_flash_attn: bool = True
     wav_decoder_channels: int = 1536
-    strides: list[int] = [4, 4, 5, 6]
+    strides: tuple[int, ...] = (4, 4, 5, 6)
     block_attention: Literal["none", "v1", "v2"] = "v2"
 
 
